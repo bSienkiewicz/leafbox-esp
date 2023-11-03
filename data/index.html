@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Plantwise</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" type="text/css" href="style.css" />
+  </head>
+  <body>
+    <h1 style="margin-top: 40px">Welcome to LEAFBOX configuration (T)</h1>
+    <h3>Device Status</h3>
+    <p>Configured: <span style="font-weight: bold">%CONFIGURED%</span></p>
+    <p>WiFi: <span style="font-weight: bold">%WIFI%</span></p>
+    <p>MQTT: <span style="font-weight: bold">%MQTT_STATUS%</span></p>
+    <small id="alert" style="color: red; margin-top: 40px"
+      >Scanning for WiFi networks...</small
+    >
+    <form
+      action="/config"
+      method="post"
+      style="
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        margin-top: 40px;
+      "
+      id="setup"
+      name="setup"
+    >
+      <h3>WiFi Setup</h3>
+      <small>Connection to your WiFi network</small>
+      <label for="ssid">Network name (SSID)</label>
+      <select id="ssid" name="ssid"></select>
+      <label for="password">Password</label>
+      <input
+        type="password"
+        name="password"
+        id="password"
+        placeholder="Password"
+        value="%WIFI_PASSWORD%"
+      />
+      <label for="sip">Channel (1-13)</label>
+      <input
+        type="tel"
+        name="channel"
+        pattern="^(1[0-3]|[1-9])$"
+        required=""
+        value="%WIFI_CHANNEL%"
+      />
+      <h3>MQTT Setup</h3>
+      <label for="mqtt_server">MQTT Server</label>
+      <div style="display: flex">
+        <p>mqtt://</p>
+        <input
+          type="text"
+          name="mqtt_server"
+          id="mqtt_server"
+          placeholder="MQTT Server"
+          required=""
+          value="%MQTT_SERVER%"
+        />
+        <p>&nbsp;:&nbsp;</p>
+        <select name="mqtt_port" id="mqtt_port" required="">
+          <option selected value="1883">1883</option>
+          <option value="8883">8883</option>
+        </select>
+      </div>
+      <label for="mqtt_user">MQTT User</label>
+      <input
+        type="text"
+        name="mqtt_user"
+        id="mqtt_user"
+        placeholder="MQTT User"
+        required=""
+        value="%MQTT_USER%"
+      />
+      <label for="mqtt_password">MQTT Password</label>
+      <input
+        type="password"
+        name="mqtt_password"
+        id="mqtt_password"
+        placeholder="MQTT Password"
+        value="%MQTT_PASSWORD%"
+      />
+      <h3>Access Point Setup</h3>
+      <label for="ap_name">AP Name</label>
+      <input
+        type="text"
+        name="ap_name"
+        id="ap_name"
+        placeholder="AP Name"
+        required=""
+        value="%AP_NAME%"
+      />
+      <label for="ap_password">AP Password</label>
+      <input
+        type="password"
+        name="ap_password"
+        id="ap_password"
+        placeholder="AP Password"
+        value="%AP_PASSWORD%"
+      />
+      <small>Leave empty for open</small>
+      <div style="margin-top: 20px">
+        <label for="hide_ap">Hide Access Point</label>
+        <input type="checkbox" name="hide_ap" id="hide_ap" value="1" />
+      </div>
+      <small style="color: red; font-weight: bold"
+        >WARNING: If you are going to hide this device, you need to remember its
+        SSID</small
+      >
+      <input
+        type="submit"
+        value="Finish the configuration"
+        style="
+          padding: 8px 8px;
+          background: #38b8b1;
+          border: 0;
+          font-weight: bold;
+          margin: 20px 0 20px;
+        "
+      />
+      <a
+        href="/reset"
+        style="
+          padding: 10px;
+          background: red;
+          color: white;
+          border-radius: 4px;
+          text-decoration: none;
+          margin-top: 20px;
+        "
+        >Factory Reset</a
+      >
+    </form>
+    <script>
+      fetch("/wifi")
+        .then((response) => response.json())
+        .then((data) => {
+          for (let network of data) {
+            let ssid = network.ssid;
+            let option = document.createElement("option");
+            option.text = ssid;
+            option.value = ssid;
+            document.getElementById("ssid").add(option);
+          }
+        })
+        .then(() => {
+          document.querySelector("#alert").remove();
+          document.querySelector("#setup").style.display = "flex";
+        });
+    </script>
+  </body>
+</html>
