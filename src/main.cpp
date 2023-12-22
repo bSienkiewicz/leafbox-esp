@@ -1,42 +1,55 @@
 #include <Arduino.h>
-#include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <AsyncTCP.h>
 #include "ESPAsyncWebServer.h"
+#include <WebSerial.h>
 #include <PubSubClient.h>
 #include "utils.h"
 #include "esp_sleep.h"
 #include "Preferences.h"
 #include "SPIFFS.h"
+#include "HTTPClient.h"
+#include "time.h"
 
 #define LED 2
 #define CALIBRATION_BUTTON 4
 #define TIME_TO_SLEEP 1200 // seconds
+#define MQTT_COMMAND_TOPIC "esp/device/command"
 
 Preferences preferences;
-DNSServer dnsServer;
 AsyncWebServer server(80);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-long lastReading = 0;
 char msg[50];
 
-const bool SLEEP_MODE = true;
-const String MQTT_USER = "plantwise";
+//// CONFIGURATION CONSTANTS
+static String MQTT_HOST = "";
+const bool SLEEP_MODE = false;
 const String AP_NAME = "LEAFBOX";
 const String AP_PASSWORD = "";
 const int MAX_PLANTS = 4;
-const int SENSOR_PINS[] = {35, 34, 39, 36};
-const int VALVE_PINS[] = {21, 22, 23, 19};
+const int SENSOR_PINS[] = {34, 35, 32, 33};
+const int VALVE_PINS[] = {19, 21, 22, 23};
+const String CONFIG_ENDPOINT = "http://192.168.0.69:5000/api/config/";
 
-StaticJsonDocument<1024> config;
+//// LOCAL TIME CONSTANTS
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0; // 3600
+const int daylightOffset_sec = 3600;
+
+//// BOOLEAN FLAGS
 bool configured = true;
 bool wifi_connected = false;
 bool mqtt_configured = false;
+bool plants_configured = false;
+bool timeSynchronized = false;
 
+//// SENSOR CALIBRATION VALUES
+bool calibration_flags[2] = {false, false};
+int calibration_values[2] = {0, 0};
 // 0%: 1496 100%: 1042
 
 class Plant
@@ -47,33 +60,42 @@ private:
   int moisture0;
   int moisture100;
   int moisturePercentage;
-  int readingAccuracy = 2;
+  int readingAccuracy = 20;
   int lowerTreshold;
   int upperTreshold;
-  int wateringTime;
-  int wateringCycles = 0;
+  int wateringTime = 5;
 
 public:
-  int id;
+  int socket;
+  int plantId;
   bool configured;
+  time_t lastReading;
+  int readingDelay;
+  int readingDelayMult;
+  SemaphoreHandle_t xSemaphore = xSemaphoreCreateBinary();
+
   Plant()
   {
     this->configured = false;
   }
 
-  Plant(int id, int sensorPin, int valvePin, int moisture0, int moisture100, int lowerTreshold, int upperTreshold, int wateringTime)
+  Plant(int socket, int sensorPin, int valvePin, int moisture0, int moisture100, int lowerTreshold, int upperTreshold, time_t lastReading, int plantId, int readingDelay, int readingDelayMult)
   {
-    this->id = id;
+    this->socket = socket;
+    this->plantId = plantId;
     this->sensorPin = sensorPin;
     this->valvePin = valvePin;
     this->moisture0 = moisture0;
     this->moisture100 = moisture100;
     this->lowerTreshold = lowerTreshold;
     this->upperTreshold = upperTreshold;
-    this->wateringTime = wateringTime;
+    this->lastReading = lastReading;
+    this->readingDelay = readingDelay;
+    this->readingDelayMult = readingDelayMult;
     this->configured = true;
-    Serial.print("Configured plant #");
-    Serial.println(this->id);
+    WebSerial.print("Configured plant on socket #");
+    WebSerial.println(this->socket);
+    WebSerial.println("Reading delay: " + String(this->readingDelay * this->readingDelayMult) + " seconds");
   }
 
   int getSensorData()
@@ -101,7 +123,7 @@ public:
     }
     else
     {
-      Serial.println("Awaiting calibration");
+      WebSerial.println("Awaiting calibration");
     }
     return moisturePercentage;
   }
@@ -109,6 +131,11 @@ public:
   int getMoisturePercentage()
   {
     return moisturePercentage;
+  }
+
+  String getSensorConfigValues()
+  {
+    return String(moisture0) + "|" + String(moisture100);
   }
 
   void startPump()
@@ -121,6 +148,15 @@ public:
     digitalWrite(valvePin, HIGH);
   }
 
+  void waterPlant()
+  {
+    WebSerial.print("→ Watering plant #" + String(this->plantId) + " on socket #" + String(this->socket) + "... ");
+    startPump();
+    delay(wateringTime * 1000);
+    stopPump();
+    delay(3000);
+  }
+
   bool isWateringNeeded()
   {
     return lowerTreshold > readMoisturePercentage();
@@ -128,56 +164,178 @@ public:
 
   void loop()
   {
-    while (isWateringNeeded() && wateringCycles < 4)
+    int wateringCycles = 0;
+    publishReading(readMoisturePercentage());
+    while (isWateringNeeded() && wateringCycles <= 3)
     {
+      waterPlant();
       wateringCycles++;
-      Serial.println("Watering...");
-      startPump();
-      delay(wateringTime * 1000);
-      stopPump();
-      delay(3000);
+    }
+    if (wateringCycles > 0)
+    {
+      publishReading(readMoisturePercentage());
+    }
+    if (wateringCycles > 3)
+    {
+      WebSerial.println("✗ Failed to water plant #" + String(this->plantId) + " on socket #" + String(this->socket) + ". Max watering cycles reached.");
     }
   }
 
   void calibration()
   {
-    digitalWrite(LED, HIGH);
-    Serial.println("Put the sensor in the dry soil and press the button");
-    while (digitalRead(CALIBRATION_BUTTON) == HIGH)
+    // STEP 1
+    WebSerial.println("Calibration step 1");
+    int m0 = 0;
+    int m100 = 0;
+    unsigned long startTime = millis();
+    while (calibration_flags[0] == false && millis() - startTime < 60000)
     {
+      vTaskDelay(100);
+    }
+    if (calibration_flags[0] == false)
+    {
+      WebSerial.println("Calibration aborted during step 1");
+      vTaskDelete(NULL);
+    }
+    for (int i = 0; i < 10; i++)
+    {
+      m0 += getSensorData();
       delay(100);
     }
-    Serial.println("Calibrating...");
-    int sum = 0;
-    for (int i = 0; i < 5; i++)
+    m0 /= 10;
+
+    // STEP 2
+    WebSerial.println("Calibration step 2");
+    startTime = millis();
+    while (calibration_flags[1] == false && millis() - startTime < 60000)
     {
-      sum += analogRead(sensorPin);
-      delay(1000);
+      vTaskDelay(100);
     }
-    moisture0 = sum / 5;
-    moisture0 -= 30;
-    Serial.println("Put the sensor in the water and press the button");
-    while (digitalRead(CALIBRATION_BUTTON) == HIGH)
+    if (calibration_flags[1] == false)
     {
+      WebSerial.println("Calibration aborted during step 2");
+      vTaskDelete(NULL);
+    }
+    for (int i = 0; i < 10; i++)
+    {
+      m100 += getSensorData();
       delay(100);
     }
-    Serial.println("Calibrating...");
-    sum = 0;
-    for (int i = 0; i < 5; i++)
+    m100 /= 10;
+
+    // STEP 3
+    WebSerial.println("Calibration complete. New values: m0: " + String(m0) + " m100: " + String(m100));
+    calibration_values[0] = m0;
+    calibration_values[1] = m100;
+    xSemaphoreGive(xSemaphore);
+    vTaskDelete(NULL);
+  }
+
+  static void calibrationTask(void *pvParameters)
+  {
+    Plant *plant = (Plant *)pvParameters;
+    plant->calibration();
+  }
+
+  void startCalibration()
+  {
+    xTaskCreatePinnedToCore(
+        calibrationTask,   /* Function to run */
+        "CalibrationTask", /* Name of the task */
+        10000,             /* Stack size (in words) */
+        this,              /* Task input parameter */
+        1,                 /* Task priority */
+        NULL,              /* Task handle */
+        0                  /* Core number */
+    );
+  }
+
+  void publishReading(int moisture)
+  {
+    if (!this->configured)
     {
-      sum += analogRead(sensorPin);
-      delay(1000);
+      return;
     }
-    moisture100 = sum / 5;
-    moisture100 += 30;
-    Serial.println("Calibration finished");
-    Serial.print("0%: " + String(moisture0) + " 100%: " + String(moisture100));
-    digitalWrite(LED, LOW);
-    delay(2000);
+    time_t now;
+    time(&now);
+    String topic = "esp/plant/" + String(this->plantId) + "/moisture";
+    if (client.publish(topic.c_str(), String(moisture).c_str()))
+      WebSerial.println("✓ Published #" + String(this->plantId) + ". Value: " + String(this->readMoisturePercentage()) + "%");
+    else
+    {
+      WebSerial.println("✗ Failed to publish.");
+    }
+    this->lastReading = now;
   }
 };
 
 Plant plants[MAX_PLANTS];
+Plant plants_to_water[MAX_PLANTS];
+
+void recvMsg(uint8_t *data, size_t len)
+{
+  String d = "";
+  for (int i = 0; i < len; i++)
+  {
+    d += char(data[i]);
+  }
+  WebSerial.println("[ " + d + " ]");
+  if (d == "ping")
+  {
+    WebSerial.println("pong");
+  }
+  if (d == "reboot")
+  {
+    ESP.restart();
+  }
+  if (d == "status")
+  {
+    // check which
+    int plants_c[4] = {0, 0, 0, 0};
+    for (Plant &plant : plants)
+    {
+      if (!plant.configured)
+        continue;
+      plants_c[plant.socket - 1]++;
+    }
+    time_t now;
+    time(&now);
+    WebSerial.println("============ STATUS ============");
+    WebSerial.println("Time: " + String(ctime(&now)));
+    WebSerial.println("WiFi: " + String(WiFi.status()));
+    WebSerial.println("MQTT: " + String(client.connected()));
+    WebSerial.println("Device configured: " + String(preferences.getBool("dev_configured", false)));
+    WebSerial.print("Sockets configured: ");
+    for (int i = 0; i < 4; i++)
+    {
+      WebSerial.print(plants_c[i] > 0 ? "#" + String(i + 1) + " " : "");
+    }
+    WebSerial.println();
+    WebSerial.println("============ TIMING ============");
+
+    for (Plant &plant : plants)
+    {
+      if (!plant.configured)
+        continue;
+      time_t last_watered = plant.lastReading;
+
+      time_t now;
+      time(&now);
+
+      WebSerial.println("→ #" + String(plant.socket) + " - Next reading in minutes: " + String((plant.readingDelay * plant.readingDelayMult - difftime(now, last_watered)) / 60) + ". Time Diff: " + String(difftime(now, last_watered)));
+    }
+    WebSerial.println("================================");
+  }
+  if (d == "analog")
+  {
+    for (Plant &plant : plants)
+    {
+      if (!plant.configured)
+        continue;
+      WebSerial.println("Plant #" + String(plant.plantId) + " on socket #" + String(plant.socket) + " - M: " + String(plant.readMoisturePercentage()) + "% || V: " + String(plant.getSensorData()));
+    }
+  }
+}
 
 void clearPlants()
 {
@@ -187,38 +345,86 @@ void clearPlants()
   }
 }
 
-void createPlantsFromConfig()
+void initSocketsFromConfig(JsonObject config)
 {
   clearPlants();
 
   int plantsConfigured = 0;
 
-  JsonObject configObject = config.as<JsonObject>();
-  for (JsonObject::iterator it = configObject.begin(); it != configObject.end(); ++it)
+  for (JsonObject::iterator it = config.begin(); it != config.end(); ++it)
   {
-    int plantId = atoi(it->key().c_str());
-    JsonObject plantData = it->value().as<JsonObject>();
+    int plant_socket = atoi(it->key().c_str());          // Get the plant ID from the key
+    JsonObject plantData = it->value().as<JsonObject>(); // Get the plant data from the value
 
-    // Check if any value is 0, skip creating the plant
-    if (plantData["moistureMin"].as<int>() == 0 || plantData["moistureMax"].as<int>() == 0 || plantData["lowerTreshold"].as<int>() == 0 || plantData["upperTreshold"].as<int>() == 0 || plantData["wateringTime"].as<int>() == 0)
+    if (plantData["moistureMin"].as<int>() == 0 || plantData["moistureMax"].as<int>() == 0)
     {
       continue;
     }
 
-    plants[plantId - 1] = Plant(
-        plantId,
-        SENSOR_PINS[plantId - 1],
-        VALVE_PINS[plantId - 1],
+    time_t lastReading = 0;
+    struct tm tm;
+
+    if (!plantData["lastReading"].isNull())
+    {
+      memset(&tm, 0, sizeof(tm));
+      strptime(plantData["lastReading"].as<String>().c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
+      lastReading = mktime(&tm);
+      lastReading += 1 * 60 * 60;
+    }
+
+    // Create the plants from the config
+    plants[plant_socket - 1] = Plant(
+        plant_socket, // 1
+        SENSOR_PINS[plant_socket - 1],
+        VALVE_PINS[plant_socket - 1],
         plantData["moistureMin"].as<int>(),
         plantData["moistureMax"].as<int>(),
         plantData["lowerTreshold"].as<int>(),
         plantData["upperTreshold"].as<int>(),
-        plantData["wateringTime"].as<int>());
+        lastReading,
+        plantData["plantId"].as<int>(),
+        plantData["readingDelay"].as<int>(),
+        plantData["readingDelayMult"].as<int>());
     plantsConfigured++;
+
+    WebSerial.println("Last watered time for plant #" + String(plant_socket) + ": " + String(ctime(&lastReading)));
   }
 
-  Serial.print(plantsConfigured);
-  Serial.println(" plants initialized from configuration.");
+  time_t now;
+  time(&now);
+  plants_configured = true;
+  WebSerial.print(plantsConfigured);
+  WebSerial.println(" plants initialized for this device.");
+  delay(100);
+}
+
+void flashLED(int times)
+{
+  for (int i = 0; i < times; i++)
+  {
+    digitalWrite(LED, HIGH);
+    delay(100);
+    digitalWrite(LED, LOW);
+    delay(100);
+  }
+}
+
+void printLocalTime()
+{
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+
+time_t stringToTime(String timeString)
+{
+  struct tm tm;
+  strptime(timeString.c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
+  return mktime(&tm) - (1 * 3600); // Subtract 2 hours to adjust for GMT
 }
 
 String processor(const String &var)
@@ -234,20 +440,21 @@ String processor(const String &var)
       return "Not connected";
     }
   }
+  else if (var == "LOCALIP"){
+    return WiFi.localIP().toString();
+  }
   else if (var == "CONFIGURED")
     return preferences.getBool("dev_configured", false) ? "Yes" : "No";
   else if (var == "MQTT_STATUS")
-    return client.connected() ? "Connected to mqtt://" + preferences.getString("mqtt_server", "") : "Not connected";
+    return client.connected() ? "Connected to mqtt://" + preferences.getString("mqtt_host", "") : "Not connected";
+  else if (var == "WIFI_SSID")
+    return preferences.getString("wifi_ssid", "");
   else if (var == "WIFI_PASSWORD")
     return preferences.getString("wifi_password", "");
   else if (var == "WIFI_CHANNEL")
     return preferences.getString("wifi_channel", "1");
-  else if (var == "MQTT_SERVER")
-    return preferences.getString("mqtt_server", "");
-  else if (var == "MQTT_USER")
-    return preferences.getString("mqtt_user", "");
-  else if (var == "MQTT_PASSWORD")
-    return preferences.getString("mqtt_password", "");
+  else if (var == "MQTT_HOST")
+    return preferences.getString("mqtt_host", "");
   else if (var == "AP_NAME")
     return preferences.getString("ap_name", AP_NAME);
   else if (var == "AP_PASSWORD")
@@ -256,25 +463,11 @@ String processor(const String &var)
     return String();
 }
 
-class CaptiveRequestHandler : public AsyncWebHandler
-{
-public:
-  CaptiveRequestHandler()
-  {}
-  virtual ~CaptiveRequestHandler() {}
-  bool canHandle(AsyncWebServerRequest *request)
-  {
-    //request->addInterestingHeader("ANY");
-    return true;
-  }
-  void handleRequest(AsyncWebServerRequest *request) {
-    request->send(SPIFFS, "/index.html","text/html", false); 
-  }
-};
-
 String getWiFiNetworks()
 {
+  Serial.print("Found WiFi networks... ");
   int numNetworks = WiFi.scanNetworks();
+  Serial.println(numNetworks);
   String json = "[";
   for (int i = 0; i < numNetworks; i++)
   {
@@ -304,6 +497,7 @@ void setup_wifi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
+    Serial.println("");
     Serial.println("✓ Connected to " + ssid + " with IP address: " + WiFi.localIP().toString());
     wifi_connected = true;
     digitalWrite(LED, LOW);
@@ -317,45 +511,132 @@ void setup_wifi()
 
 void callback(char *topic, byte *message, unsigned int length)
 {
-  Serial.print("Message on topic: ");
-  Serial.println(topic);
+  String topicString = String(topic);
+  char messageArr[length + 1];
+  memcpy(messageArr, message, length);
+  messageArr[length] = '\0';
+  String messageString = String(messageArr);
 
-  if (String(topic) == "esp/config")
+  std::vector<String> topicParts;
+
+  int startIndex = 0;
+  int endIndex = 0;
+
+  while ((endIndex = topicString.indexOf('/', startIndex)) != -1)
   {
-    deserializeJson(config, (char *)message);
-    createPlantsFromConfig();
+    topicParts.push_back(topicString.substring(startIndex, endIndex));
+    startIndex = endIndex + 1;
+  }
+
+  topicParts.push_back(topicString.substring(startIndex));
+
+  if (topicParts[2] == "command" && messageString[0] == '{')
+  {
+    StaticJsonDocument<1024> msg_doc;
+    StaticJsonDocument<1024> msg_data;
+    deserializeJson(msg_doc, messageString);
+    JsonObject obj = msg_doc.as<JsonObject>();
+    String type = obj["type"].as<String>();
+    String mac = obj["mac"].as<String>();
+    JsonObject data = obj["data"].as<JsonObject>();
+
+    if (mac == WiFi.macAddress())
+    {
+      if (type == "config")
+      {
+        initSocketsFromConfig(data);
+      }
+      else if (type == "calibrate")
+      {
+        int step = data["step"].as<int>();
+        int plant = data["plant"].as<int>();
+        if (step == 1)
+        {
+          plants[plant - 1].startCalibration();
+        }
+        else if (step == 2)
+        {
+          calibration_flags[0] = true;
+        }
+        else if (step == 3)
+        {
+          calibration_flags[1] = true;
+          xSemaphoreTake(plants[plant - 1].xSemaphore, portMAX_DELAY);
+          String payload = "{\"mac\":\"" + mac + "\", \"socket\":" + String(plant) + ", \"values\":\"" + String(calibration_values[0]) + "|" + String(calibration_values[1]) + "\"}";
+          client.publish("esp/device/calibration", payload.c_str());
+          calibration_flags[0] = false;
+          calibration_flags[1] = false;
+        }
+      }
+      else if (type == "reboot")
+      {
+        ESP.restart();
+      }
+      else if (type == "reading")
+      {
+        int plant_id = data["plant_id"].as<int>();
+        for (Plant &plant : plants)
+        {
+          if (!plant.configured)
+            continue;
+          if (plant.plantId == plant_id)
+          {
+            plant.publishReading(plant.readMoisturePercentage());
+          }
+        }
+      }
+      else if (type == "watering")
+      {
+        int plant_id = data["plant_id"].as<int>();
+        for (Plant &plant : plants)
+        {
+          if (!plant.configured)
+            continue;
+          if (plant.plantId == plant_id)
+          {
+            plant.waterPlant();
+            plant.publishReading(plant.readMoisturePercentage());
+          }
+        }
+      }
+    }
   }
 }
-void mqtt_reconnect()
+
+void conn_reconnect()
 {
   delay(200);
   client.disconnect();
   if (WiFi.status() != WL_CONNECTED)
     setup_wifi();
-  String un = preferences.getString("mqtt_user", MQTT_USER) + "/" + String(random(0xffff), HEX);
-  if (client.connect(un.c_str()))
+  String client_id = "leafbox-client-";
+  client_id += String(random(0xffff), HEX);
+  if (client.connect(client_id.c_str()))
   {
-    Serial.println("✓ Connected to MQTT broker as " + un);
+    client.setKeepAlive(240);
+    client.setSocketTimeout(240);
+    client.setBufferSize(1024);
+    String subscription_topic = MQTT_COMMAND_TOPIC;
+    client.subscribe(subscription_topic.c_str());
+    client.setCallback(callback);
+    Serial.println("✓ Connected to MQTT broker on " + MQTT_HOST + ":1883 as " + client_id);
   }
   else
   {
     Serial.print("✗ Failed to connect to MQTT broker as ");
-    Serial.print(un.c_str());
-    Serial.print(" rc = ");
-    Serial.print(client.state());
+    Serial.print(client_id.c_str());
+    Serial.print(" on host ");
+    Serial.print(MQTT_HOST);
+    Serial.print(":1883");
     Serial.println(" Retrying in 5 seconds...");
+    flashLED(3);
     delay(5000);
   }
 }
 
-void mqtt_config(String server, int port)
+void mqtt_config(int port)
 {
-  client.setServer("192.168.0.69", 1883);
-  client.setKeepAlive(240);
-  client.setSocketTimeout(240);
-  client.setBufferSize(500);
-  client.subscribe("esp/#");
-  client.setCallback(callback);
+  client.setServer(MQTT_HOST.c_str(), 1883);
   mqtt_configured = true;
   Serial.println("✓ MQTT configuration successful");
 }
@@ -364,7 +645,7 @@ void setupServer()
 {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
             { request->send(SPIFFS, "/index.html", "text/html", false, processor); 
-            Serial.println("✓ Client connected"); });
+            WebSerial.println("✓ HTTP Client connected"); });
   server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request)
             { request->send(SPIFFS, "/style.css", "text/css"); });
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -373,34 +654,29 @@ void setupServer()
     request->send(200, "application/json", wifiNetworks); });
   server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request)
             {
-    if (request->hasParam("ssid", true) && request->hasParam("channel", true) && request->hasParam("mqtt_server", true) && request->hasParam("mqtt_port", true) && request->hasParam("mqtt_user", true)) {
+    if (request->hasParam("ssid", true) && request->hasParam("channel", true) && request->hasParam("mqtt_host", true) && request->hasParam("backend_p", true)) {
       AsyncWebParameter *ssid = request->getParam("ssid", true);
       AsyncWebParameter *password = request->getParam("password", true);
       AsyncWebParameter *channel = request->getParam("channel", true);
-      AsyncWebParameter *mqtt_server = request->getParam("mqtt_server", true);
-      AsyncWebParameter *mqtt_port = request->getParam("mqtt_port", true);
-      AsyncWebParameter *mqtt_user = request->getParam("mqtt_user", true);
-      AsyncWebParameter *mqtt_password = request->getParam("mqtt_password", true);
+      AsyncWebParameter *mqtt_host = request->getParam("mqtt_host", true);
+      AsyncWebParameter *backend_p = request->getParam("backend_p", true);
       AsyncWebParameter *ap_name = request->getParam("ap_name", true);
       AsyncWebParameter *ap_password = request->getParam("ap_password", true);
 
-      Serial.println("ssid: " + ssid->value());
-      Serial.println("password: " + password->value());
-      Serial.println("channel: " + channel->value());
-      Serial.println("mqtt_server: " + mqtt_server->value());
-      Serial.println("mqtt_port: " + mqtt_port->value());
-      Serial.println("mqtt_user: " + mqtt_user->value());
-      Serial.println("mqtt_password: " + mqtt_password->value());
-      Serial.println("ap_name: " + ap_name->value());
-      Serial.println("ap_password: " + ap_password->value());
+      // DEBUG PRINTS
+      // WebSerial.println("ssid: " + ssid->value());
+      // WebSerial.println("password: " + password->value());
+      // WebSerial.println("channel: " + channel->value());
+      // WebSerial.println("mqtt_host: " + mqtt_host->value());
+      // WebSerial.println("backend_p: " + backend_p->value());
+      // WebSerial.println("ap_name: " + ap_name->value());
+      // WebSerial.println("ap_password: " + ap_password->value());
 
       preferences.putString("wifi_ssid", ssid->value());
       preferences.putString("wifi_password", password->value());
       preferences.putString("wifi_channel", channel->value());
-      preferences.putString("mqtt_server", mqtt_server->value());
-      preferences.putString("mqtt_port", mqtt_port->value());
-      preferences.putString("mqtt_user", mqtt_user->value());
-      preferences.putString("mqtt_password", mqtt_password->value());
+      preferences.putString("mqtt_host", mqtt_host->value());
+      preferences.putString("backend_p", backend_p->value());
       preferences.putString("ap_name", ap_name->value());
       preferences.putString("ap_password", ap_password->value());
       preferences.putBool("dev_configured", true);
@@ -418,8 +694,8 @@ void setupServer()
     delay(5000);
     ESP.restart(); });
 
-  dnsServer.start(53, "*", WiFi.softAPIP());
-  server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);
+  // dnsServer.start(53, "*", WiFi.softAPIP());
+  // server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);
   server.begin();
   Serial.println("✓ Server setup successful");
 }
@@ -437,47 +713,52 @@ void setup_ap()
   Serial.println("✓ AP started with name: " + WiFi.softAPSSID() + " and IP: " + WiFi.softAPIP().toString());
 }
 
-void connection_setup(void *pvParameters)
+void connection_init()
 {
   if (preferences.getBool("dev_configured", false))
   {
     setup_wifi();
-    mqtt_config(preferences.getString("mqtt_server"), preferences.getString("mqtt_port").toInt());
+    mqtt_config(1883);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   }
   else
   {
-    Serial.println("✗ Connection not configured. WiFi and MQTT disconnected");
+    Serial.println("✗ Connection not configured. WiFi and MQTT not connected");
   }
-  Serial.print("✓ All set. Sleeping core ");
-  Serial.println(xPortGetCoreID());
-  vTaskDelete(NULL);
+  WebSerial.begin(&server);
+  WebSerial.msgCallback(recvMsg);
+
+  Serial.print("✓ Connection setup successful.");
 }
 
-void dnsServerTask(void *parameter)
+void requestConfig()
 {
-  Serial.print("✓ DNS Server started at core ");
-  Serial.println(xPortGetCoreID());
-  for (;;)
+  if (!client.connected() || WiFi.status() != WL_CONNECTED)
+    conn_reconnect();
+  if (!plants_configured)
   {
-    dnsServer.processNextRequest();
-    vTaskDelay(pdMS_TO_TICKS(20)); // Delay to avoid high CPU usage
+    String request_topic = "esp/device/config/request";
+    client.publish(request_topic.c_str(), WiFi.macAddress().c_str());
   }
+  delay(1000);
 }
 
-void setupPreferences()
+void sustain_connection(void *pvParameters)
 {
-  preferences.putString("wifi_ssid", "");
-  preferences.putString("wifi_password", "");
-  preferences.putString("wifi_channel", "1");
-  preferences.putString("mqtt_server", "");
-  preferences.putString("mqtt_port", "1883");
-  preferences.putString("mqtt_user", "");
-  preferences.putString("mqtt_password", "");
-  preferences.putString("ap_name", AP_NAME);
-  preferences.putString("ap_password", AP_PASSWORD);
-  preferences.putBool("dev_configured", false);
-  preferences.putBool("initialized", true);
-  Serial.println("✓ Preferences initialized");
+  while (true)
+  {
+    if (preferences.getBool("dev_configured", false) && WiFi.isConnected() && !client.connected() && mqtt_configured)
+    {
+      Serial.println("! MQTT disconnected. Reconnecting...");
+      conn_reconnect();
+    }
+    if (!client.connected())
+      conn_reconnect();
+    if (!plants_configured)
+      requestConfig();
+    client.loop();
+    vTaskDelay(50);
+  }
 }
 
 void setup()
@@ -491,107 +772,97 @@ void setup()
   }
   pinMode(LED, OUTPUT);
   pinMode(21, OUTPUT);
-  pinMode(CALIBRATION_BUTTON, INPUT_PULLUP);
   digitalWrite(21, HIGH);
+  for (int i = 0; i < MAX_PLANTS; i++)
+  {
+    pinMode(SENSOR_PINS[i], INPUT);
+    pinMode(VALVE_PINS[i], OUTPUT);
+    digitalWrite(VALVE_PINS[i], HIGH);
+  }
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_4, 0);
   WiFi.mode(WIFI_AP_STA);
   digitalWrite(LED, HIGH);
-
   preferences.begin("device_config", false);
-  if (!preferences.getBool("initialized", false))
-    setupPreferences();
   setupServer();
   setup_ap();
+  MQTT_HOST = preferences.getString("mqtt_host", "");
+
+  connection_init();
+
+  Serial.println("⌚ synchronizing time...");
+  while (!timeSynchronized)
+  {
+    time_t now;
+    time(&now);
+    if (now > 24 * 3600)
+    {
+      timeSynchronized = true;
+      Serial.println("✓ Time synchronized. Current time: " + String(ctime(&now)));
+    }
+    delay(20);
+  }
 
   xTaskCreatePinnedToCore(
-      connection_setup,  /* Task function. */
-      "SetupConnection", /* name of task. */
-      25384,             /* Stack size of task */
-      NULL,              /* parameter of the task */
-      2,                 /* priority of the task */
-      NULL,              /* Task handle to keep track of created task */
-      0);
-
-  xTaskCreatePinnedToCore(
-      dnsServerTask,   // Task function
-      "dnsServerTask", // Task name
-      10000,           // Stack size (adjust as needed)
-      NULL,            // Task parameter
-      1,               // Task priority
-      NULL,            // Task handle
-      0                // Core to pin the task to (0 or 1)
+      sustain_connection,  /* Function to run */
+      "SustainConnection", /* Name of the task */
+      10000,               /* Stack size (in words) */
+      NULL,                /* Task input parameter */
+      2,                   /* Task priority */
+      NULL,                /* Task handle */
+      0                    /* Core number */
   );
+  Serial.println("✓ Setup complete. Device ready.");
 }
 
-unsigned long lastReadingMillis = 0;
-unsigned long readingDelay = 5000;
+unsigned long lastOutputMillis = 0;
+unsigned long lastCheckMillis = 0;
 
 void loop()
 {
-  if (preferences.getBool("dev_configured", false) && WiFi.isConnected() && !client.connected() && mqtt_configured)
+  for (Plant &plant : plants)
   {
-    mqtt_reconnect();
-  }
-
-  unsigned long currentMillis = millis();
-  client.loop();
-
-  if (currentMillis - lastReadingMillis >= readingDelay && false)
-  {
-    lastReadingMillis = currentMillis;
-
-    bool anyPlantConfigured = false;
-
-    for (Plant plant : plants)
+    if (!plant.configured)
     {
-      if (plant.configured)
+      continue;
+    }
+
+    time_t last_watered = plant.lastReading;
+
+    time_t now;
+    time(&now);
+
+    if ((difftime(now, last_watered) > plant.readingDelay * plant.readingDelayMult) || difftime(now, last_watered) < 0)
+    {
+      plant.loop();
+    }
+  }
+  
+  // for (Plant &plant_to_water : plants_to_water)
+  // {
+  //   if (!plant_to_water.configured)
+  //     continue;
+  //   WebSerial.println("Watering plant #" + String(plant_to_water.plantId) + " on socket #" + String(plant_to_water.socket) + "... Moisture: " + String(plant_to_water.readMoisturePercentage()) + "%");
+  // }
+  delay(1000);
+
+  if (millis() - lastOutputMillis > 10000 && false)
+  {
+    lastOutputMillis = millis();
+    if (plants_configured)
+    {
+      Serial.println("=====================================");
+      for (Plant &plant : plants)
       {
-        anyPlantConfigured = true;
+        if (!plant.configured)
+          continue;
+        time_t last_watered = plant.lastReading;
 
-        String topic = "esp/plant/" + String(plant.id) + "/moisture";
-        if (client.publish(topic.c_str(), String(plant.readMoisturePercentage()).c_str()))
-          Serial.println(String(plant.getMoisturePercentage()) + "% published");
-        else
-        {
-          Serial.println("✗ Failed to publish");
-          for (int i = 0; i < 3; i++)
-          {
-            if (client.connected())
-              break;
-            mqtt_reconnect();
-            client.loop();
-            delay(5000);
-            if (client.publish(topic.c_str(), String(plant.readMoisturePercentage()).c_str()))
-            {
-              Serial.println(String(plant.getMoisturePercentage()) + "\% published");
-              break;
-            }
-          }
-        }
+        time_t now;
+        time(&now);
+
+        Serial.println("→ #" + String(plant.socket) + " - Next reading in minutes: " + String((plant.readingDelay * plant.readingDelayMult - difftime(now, last_watered)) / 60));
       }
-    }
-    // if (!anyPlantConfigured) {
-    //   Serial.println("No plants configured");
-    //   client.publish("esp/error", "Failed to read config!");
-    //   sleep_for(120);
-    // } else {
-    //   sleep_for(TIME_TO_SLEEP);
-    // }
-  }
-  if (Serial.available())
-  {
-    String command = Serial.readString();
-    Serial.print("Command: ");
-    Serial.println(command);
-    if (command == "restart")
-    {
-      ESP.restart();
-    }
-    else if (command == "factory")
-    {
-      preferences.clear();
-      delay(200);
-      ESP.restart();
+      Serial.println("=====================================");
     }
   }
 }

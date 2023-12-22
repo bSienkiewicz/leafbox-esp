@@ -10,15 +10,16 @@
     <h3>Device Status</h3>
     <p>Configured: <span style="font-weight: bold">%CONFIGURED%</span></p>
     <p>WiFi: <span style="font-weight: bold">%WIFI%</span></p>
+    <p>Local IP: <span style="font-weight: bold">%LOCALIP%</span></p>
     <p>MQTT: <span style="font-weight: bold">%MQTT_STATUS%</span></p>
-    <small id="alert" style="color: red; margin-top: 40px"
+    <!-- <small id="alert" style="color: red; margin-top: 40px"
       >Scanning for WiFi networks...</small
-    >
+    > -->
     <form
       action="/config"
       method="post"
       style="
-        display: none;
+        display: flex;
         flex-direction: column;
         align-items: center;
         text-align: center;
@@ -30,7 +31,14 @@
       <h3>WiFi Setup</h3>
       <small>Connection to your WiFi network</small>
       <label for="ssid">Network name (SSID)</label>
-      <select id="ssid" name="ssid"></select>
+      <input
+        type="text"
+        name="ssid"
+        id="ssid"
+        placeholder="Network name (SSID)"
+        required
+        value="%WIFI_SSID%"
+      />
       <label for="password">Password</label>
       <input
         type="password"
@@ -48,40 +56,22 @@
         value="%WIFI_CHANNEL%"
       />
       <h3>MQTT Setup</h3>
-      <label for="mqtt_server">MQTT Server</label>
+      <label for="mqtt_host">Broker Host</label>
       <div style="display: flex">
         <p>mqtt://</p>
         <input
           type="text"
-          name="mqtt_server"
-          id="mqtt_server"
+          name="mqtt_host"
+          id="mqtt_host"
           placeholder="MQTT Server"
           required=""
-          value="%MQTT_SERVER%"
+          value="%MQTT_HOST%"
         />
-        <p>&nbsp;:&nbsp;</p>
-        <select name="mqtt_port" id="mqtt_port" required="">
-          <option selected value="1883">1883</option>
-          <option value="8883">8883</option>
-        </select>
+        <p>&nbsp;:1883</p>
       </div>
-      <label for="mqtt_user">MQTT User</label>
-      <input
-        type="text"
-        name="mqtt_user"
-        id="mqtt_user"
-        placeholder="MQTT User"
-        required=""
-        value="%MQTT_USER%"
-      />
-      <label for="mqtt_password">MQTT Password</label>
-      <input
-        type="password"
-        name="mqtt_password"
-        id="mqtt_password"
-        placeholder="MQTT Password"
-        value="%MQTT_PASSWORD%"
-      />
+      <small style="color: red; font-weight: bold"
+        >Remember to add port if necessary</small
+      >
       <h3>Access Point Setup</h3>
       <label for="ap_name">AP Name</label>
       <input
@@ -134,7 +124,7 @@
       >
     </form>
     <script>
-      fetch("/wifi")
+      /* fetch("/wifi")
         .then((response) => response.json())
         .then((data) => {
           for (let network of data) {
@@ -148,7 +138,7 @@
         .then(() => {
           document.querySelector("#alert").remove();
           document.querySelector("#setup").style.display = "flex";
-        });
+        }); */
     </script>
   </body>
 </html>
