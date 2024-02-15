@@ -2,6 +2,8 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <AsyncTCP.h>
 #include "ESPAsyncWebServer.h"
 #include <WebSerial.h>
@@ -37,21 +39,21 @@ const String CONFIG_ENDPOINT = "http://192.168.0.69:5000/api/config/";
 
 //// LOCAL TIME CONSTANTS
 const char *ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 0; // 3600
+const int gmtOffset_sec = 0; // 3600
 const int daylightOffset_sec = 3600;
 
 //// BOOLEAN FLAGS
 bool configured = true;
 bool wifi_connected = false;
 bool mqtt_configured = false;
-bool plants_configured = false;
+bool sockets_configured = false;
 bool timeSynchronized = false;
 
 //// SENSOR CALIBRATION VALUES
 bool calibration_flags[2] = {false, false};
 int calibration_values[2] = {0, 0};
-// 0%: 1496 100%: 1042
 
+/*          SOIL MOISTURE SENSOR          */
 class Plant
 {
 private:
@@ -260,7 +262,10 @@ public:
     time(&now);
     String topic = "esp/plant/" + String(this->plantId) + "/moisture";
     if (client.publish(topic.c_str(), String(moisture).c_str()))
-      WebSerial.println("✓ Published #" + String(this->plantId) + ". Value: " + String(this->readMoisturePercentage()) + "%");
+    {
+      Serial.println("✓ Published M for #" + String(this->plantId) + ". Value: " + String(this->readMoisturePercentage()) + "%");
+      WebSerial.println("✓ Published M for #" + String(this->plantId) + ". Value: " + String(this->readMoisturePercentage()) + "%");
+    }
     else
     {
       WebSerial.println("✗ Failed to publish.");
@@ -270,6 +275,85 @@ public:
 };
 
 Plant plants[MAX_PLANTS];
+
+/*          TEMPERATURE SENSOR          */
+
+class TemperatureSensor
+{
+private:
+  int sensorPin;
+  OneWire oneWire;
+  DallasTemperature sensor;
+
+public:
+  int socket;
+  bool configured;
+  time_t lastReading;
+  int readingDelay = 2;
+  int readingDelayMult = 1;
+
+  TemperatureSensor()
+  {
+    this->configured = false;
+  }
+
+  TemperatureSensor(int socket, int sensorPin, int lastReading)
+      : oneWire(sensorPin), sensor(&oneWire)
+  {
+    this->socket = socket;
+    this->sensorPin = sensorPin;
+    this->lastReading = lastReading;
+    this->configured = true;
+
+    this->sensor.begin();
+
+    Serial.print("Configured temperature sensor on socket #");
+    Serial.println(this->socket);
+  }
+
+  float readTemperature()
+  {
+    this->sensor.requestTemperatures();
+    float tempC = this->sensor.getTempCByIndex(0);
+    return tempC;
+  }
+
+  void publishReading(float temperature)
+  {
+    if (!this->configured)
+    {
+      return;
+    }
+
+    if (temperature == -127.0)
+    {
+      Serial.println("Error: Sensor not connected");
+      return;
+    }
+    
+    String topic = "esp/device/" + String(WiFi.macAddress()) + "/temperature";
+    if (client.publish(topic.c_str(), String(temperature).c_str()))
+    {
+      Serial.println("✓ Published Temp. Value: " + String(this->readTemperature()) + "ºC");
+      WebSerial.println("✓ Published Temp. Value: " + String(this->readTemperature()) + "ºC");
+    }
+    else
+    {
+      WebSerial.println("✗ Failed to publish.");
+    }
+    
+    time_t now;
+    time(&now);
+    this->lastReading = now;
+  }
+
+  void loop()
+  {
+    publishReading(readTemperature());
+  }
+};
+
+TemperatureSensor temperatureSensors[MAX_PLANTS];
 Plant plants_to_water[MAX_PLANTS];
 
 void recvMsg(uint8_t *data, size_t len)
@@ -345,56 +429,88 @@ void clearPlants()
   }
 }
 
+void clearTemperatureSensors()
+{
+  for (int i = 0; i < MAX_PLANTS; i++)
+  {
+    temperatureSensors[i] = TemperatureSensor();
+  }
+}
+
 void initSocketsFromConfig(JsonObject config)
 {
+  Serial.println("Reinitializing sockets from config...");
   clearPlants();
+  clearTemperatureSensors();
 
   int plantsConfigured = 0;
+  int tempConfigured = 0;
 
   for (JsonObject::iterator it = config.begin(); it != config.end(); ++it)
   {
-    int plant_socket = atoi(it->key().c_str());          // Get the plant ID from the key
-    JsonObject plantData = it->value().as<JsonObject>(); // Get the plant data from the value
+    int plant_socket = atoi(it->key().c_str());           // Get the plant ID from the key
+    JsonObject socketData = it->value().as<JsonObject>(); // Get the plant data from the value
 
-    if (plantData["moistureMin"].as<int>() == 0 || plantData["moistureMax"].as<int>() == 0)
+    if (socketData["sensorType"] == "soil")
     {
-      continue;
+      if (socketData["moistureMin"].as<int>() == 0 || socketData["moistureMax"].as<int>() == 0)
+      {
+        continue;
+      }
+
+      time_t lastReading = 0;
+      struct tm tm;
+
+      if (!socketData["lastReading"].isNull())
+      {
+        memset(&tm, 0, sizeof(tm));
+        strptime(socketData["lastReading"].as<String>().c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
+        lastReading = mktime(&tm);
+        lastReading += 1 * 60 * 60;
+      }
+
+      // Create the plants from the config
+      plants[plant_socket - 1] = Plant(
+          plant_socket, // 1
+          SENSOR_PINS[plant_socket - 1],
+          VALVE_PINS[plant_socket - 1],
+          socketData["moistureMin"].as<int>(),
+          socketData["moistureMax"].as<int>(),
+          socketData["lowerTreshold"].as<int>(),
+          socketData["upperTreshold"].as<int>(),
+          lastReading,
+          socketData["plantId"].as<int>(),
+          socketData["readingDelay"].as<int>(),
+          socketData["readingDelayMult"].as<int>());
+      plantsConfigured++;
     }
-
-    time_t lastReading = 0;
-    struct tm tm;
-
-    if (!plantData["lastReading"].isNull())
+    else if (socketData["sensorType"] == "temperature")
     {
+      time_t lastReading = 0;
+      struct tm tm;
+
       memset(&tm, 0, sizeof(tm));
-      strptime(plantData["lastReading"].as<String>().c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
+      strptime(socketData["lastReading"].as<String>().c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
       lastReading = mktime(&tm);
       lastReading += 1 * 60 * 60;
+
+      temperatureSensors[plant_socket - 1] = TemperatureSensor(
+          plant_socket,
+          SENSOR_PINS[plant_socket - 1],
+          lastReading
+          );
+      tempConfigured++;
     }
-
-    // Create the plants from the config
-    plants[plant_socket - 1] = Plant(
-        plant_socket, // 1
-        SENSOR_PINS[plant_socket - 1],
-        VALVE_PINS[plant_socket - 1],
-        plantData["moistureMin"].as<int>(),
-        plantData["moistureMax"].as<int>(),
-        plantData["lowerTreshold"].as<int>(),
-        plantData["upperTreshold"].as<int>(),
-        lastReading,
-        plantData["plantId"].as<int>(),
-        plantData["readingDelay"].as<int>(),
-        plantData["readingDelayMult"].as<int>());
-    plantsConfigured++;
-
-    WebSerial.println("Last watered time for plant #" + String(plant_socket) + ": " + String(ctime(&lastReading)));
   }
 
   time_t now;
   time(&now);
-  plants_configured = true;
-  WebSerial.print(plantsConfigured);
-  WebSerial.println(" plants initialized for this device.");
+  sockets_configured = true;
+  Serial.print("✓ Initialized ");
+  Serial.print(plantsConfigured);
+  Serial.print(" plants and ");
+  Serial.print(tempConfigured);
+  Serial.println(" temperature sensors");
   delay(100);
 }
 
@@ -440,7 +556,8 @@ String processor(const String &var)
       return "Not connected";
     }
   }
-  else if (var == "LOCALIP"){
+  else if (var == "LOCALIP")
+  {
     return WiFi.localIP().toString();
   }
   else if (var == "CONFIGURED")
@@ -654,7 +771,7 @@ void setupServer()
     request->send(200, "application/json", wifiNetworks); });
   server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request)
             {
-    if (request->hasParam("ssid", true) && request->hasParam("channel", true) && request->hasParam("mqtt_host", true) && request->hasParam("backend_p", true)) {
+    if (request->hasParam("ssid", true) && request->hasParam("channel", true) && request->hasParam("mqtt_host", true)) {
       AsyncWebParameter *ssid = request->getParam("ssid", true);
       AsyncWebParameter *password = request->getParam("password", true);
       AsyncWebParameter *channel = request->getParam("channel", true);
@@ -735,7 +852,7 @@ void requestConfig()
 {
   if (!client.connected() || WiFi.status() != WL_CONNECTED)
     conn_reconnect();
-  if (!plants_configured)
+  if (!sockets_configured)
   {
     String request_topic = "esp/device/config/request";
     client.publish(request_topic.c_str(), WiFi.macAddress().c_str());
@@ -754,7 +871,7 @@ void sustain_connection(void *pvParameters)
     }
     if (!client.connected())
       conn_reconnect();
-    if (!plants_configured)
+    if (!sockets_configured)
       requestConfig();
     client.loop();
     vTaskDelay(50);
@@ -836,33 +953,45 @@ void loop()
       plant.loop();
     }
   }
-  
-  // for (Plant &plant_to_water : plants_to_water)
-  // {
-  //   if (!plant_to_water.configured)
-  //     continue;
-  //   WebSerial.println("Watering plant #" + String(plant_to_water.plantId) + " on socket #" + String(plant_to_water.socket) + "... Moisture: " + String(plant_to_water.readMoisturePercentage()) + "%");
-  // }
-  delay(1000);
 
-  if (millis() - lastOutputMillis > 10000 && false)
+  for (TemperatureSensor &sensor : temperatureSensors)
   {
-    lastOutputMillis = millis();
-    if (plants_configured)
+    if (!sensor.configured)
     {
-      Serial.println("=====================================");
-      for (Plant &plant : plants)
-      {
-        if (!plant.configured)
-          continue;
-        time_t last_watered = plant.lastReading;
+      continue;
+    }
 
-        time_t now;
-        time(&now);
+    time_t last_reading = sensor.lastReading;
 
-        Serial.println("→ #" + String(plant.socket) + " - Next reading in minutes: " + String((plant.readingDelay * plant.readingDelayMult - difftime(now, last_watered)) / 60));
-      }
-      Serial.println("=====================================");
+    time_t now;
+    time(&now);
+
+    if ((difftime(now, last_reading) > sensor.readingDelay * sensor.readingDelayMult) || difftime(now, last_reading) < 0)
+    {
+      sensor.loop();
     }
   }
+
+  delay(1000);
+
+  // if (millis() - lastOutputMillis > 10000 && false)
+  // {
+  //   lastOutputMillis = millis();
+  //   if (sockets_configured)
+  //   {
+  //     Serial.println("=====================================");
+  //     for (Plant &plant : plants)
+  //     {
+  //       if (!plant.configured)
+  //         continue;
+  //       time_t last_watered = plant.lastReading;
+
+  //       time_t now;
+  //       time(&now);
+
+  //       Serial.println("→ #" + String(plant.socket) + " - Next reading in minutes: " + String((plant.readingDelay * plant.readingDelayMult - difftime(now, last_watered)) / 60));
+  //     }
+  //     Serial.println("=====================================");
+  //   }
+  // }
 }

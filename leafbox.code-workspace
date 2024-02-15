@@ -3,10 +3,6 @@
     {
       "name": "leafbox",
       "path": "."
-    },
-    {
-      "name": "DB18 test",
-      "path": "../DB18 test"
     }
   ],
   "settings": {
