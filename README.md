@@ -1,7 +1,7 @@
 ## Leafbox ESP
 
 #### Project map:
-* **[Leafbox Web App](https://github.com/bSienkiewicz/burger-dashboard)**
+* **[Leafbox Web App](https://github.com/bSienkiewicz/leafbox)**
 * ***Leafbox ESP32***
 * **[Leafbox API](https://github.com/bSienkiewicz/leafbox-api)**
 ---
